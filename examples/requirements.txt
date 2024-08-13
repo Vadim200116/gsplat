@@ -17,3 +17,4 @@ tyro
 Pillow
 tensorboard
 pyyaml
+segmentation_models_pytorch

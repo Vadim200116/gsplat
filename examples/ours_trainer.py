@@ -26,7 +26,7 @@ from typing_extensions import assert_never
 
 from datasets.colmap import Dataset, Parser, CustomDataset
 from datasets.traj import generate_interpolated_path
-from utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_random_seed
+from utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_random_seed, TransientModule, ssim, l1_loss
 
 
 @dataclass
@@ -46,6 +46,8 @@ class Config:
     test_every: int = 8
     # Validation frames prefix
     val_keyword: str = "ref"
+    # Use transient network
+    transient: bool = False
     # Random crop size for training  (experimental)
     patch_size: Optional[int] = None
     # A global scaler that applies to the scene size related parameters
@@ -82,6 +84,10 @@ class Config:
     init_scale: float = 1.0
     # Weight for SSIM loss
     ssim_lambda: float = 0.2
+    # enable alpha scheduling
+    schedule: bool = True
+    # alpha sampling schedule rate (higher more robust)
+    schedule_beta: float = -3e-3
 
     # Near plane clipping distance
     near_plane: float = 0.01
@@ -354,8 +360,18 @@ class Runner:
             if world_size > 1:
                 self.app_module = DDP(self.app_module)
 
+        if self.transient:
+            self.transient_module = TransientModule().cuda()
+
+        self.transient_optimizers = [torch.optim.Adam(
+            self.transient_module.parameters(), lr=1e-5,
+        )]
+        self.transient_loss = lambda weights, l1: torch.mean(
+            ((1-weights) * l1).mean() + 0.1 * torch.abs(weights).mean()
+        )
+
         # Losses & Metrics.
-        self.ssim = StructuralSimilarityIndexMeasure(data_range=1.0).to(self.device)
+        self.ssim = ssim
         self.psnr = PeakSignalNoiseRatio(data_range=1.0).to(self.device)
         self.lpips = LearnedPerceptualImagePatchSimilarity(normalize=True).to(
             self.device
@@ -463,6 +479,8 @@ class Runner:
         # Training loop.
         global_tic = time.time()
         pbar = tqdm.tqdm(range(init_step, max_steps))
+
+        self.transient_module.train()
         for step in pbar:
             if not cfg.disable_viewer:
                 while self.viewer.state.status == "paused":
@@ -527,12 +545,31 @@ class Runner:
                 info=info,
             )
 
-            # loss
-            l1loss = F.l1_loss(colors, pixels)
+            l1loss = l1_loss(colors, pixels)
             ssimloss = 1.0 - self.ssim(
-                pixels.permute(0, 3, 1, 2), colors.permute(0, 3, 1, 2)
+                pixels.permute(0, 3, 1, 2), colors.permute(0, 3, 1, 2), size_average=False,
             )
-            loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
+
+            if cfg.transient:
+                weights = self.transient_module(pixels)
+                pred_mask = (weights.clone().detach() > 0.5).float()
+    
+                if cfg.schedule:
+                    # schedule sampling of the mask based on alpha
+                    alpha = np.exp(cfg.schedule_beta * np.floor((1 + step) / 1.5))
+                    pred_mask = 1 - torch.bernoulli(
+                        torch.clip(alpha + (1 - alpha) * (1-pred_mask.clone().detach()),
+                        min=0.0, max=1.0))
+
+                
+                l1loss *= (1 - pred_mask)
+                ssimloss *= (1 - pred_mask)
+            
+                diff = torch.abs(colors.detach() - pixels)
+                transient_loss = self.transient_loss(weights, diff)
+                transient_loss.backward()
+
+            loss = (l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda).mean()
             if cfg.depth_loss:
                 # query depths from depth map
                 points = torch.stack(
@@ -676,6 +713,9 @@ class Runner:
             for optimizer in self.app_optimizers:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
+            for optimizer in self.transient_optimizers:
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
             for scheduler in schedulers:
                 scheduler.step()
 
@@ -798,6 +838,31 @@ class Runner:
 
         return val_frames
 
+    def mask_frames(self, dataloader):
+        def mask_frame(frame, mask):
+            mask_ = np.expand_dims(np.array(mask.detach().cpu().numpy()), 2).repeat(3, axis=2)
+            img_np = (frame[:3].cpu().numpy() * 255).astype(np.uint8)
+
+            h,w = img_np.shape[:2]
+            green = np.zeros([h, w, 3]) 
+            green[:,:,1] = 255
+            alpha = 0.6
+            fuse_img = (1-alpha)*img_np + alpha*green
+            fuse_img = mask_ * fuse_img + (1-mask_)*img_np
+
+            return fuse_img
+
+        masked_frames = []
+        self.transient_module.eval()
+        for data in dataloader:
+            pixels = data["image"].to(self.device) / 255.0
+            weights = self.transient_module(pixels)
+            mask = (weights > 0.5).float()
+            masked_frame = mask_frame(pixels, mask)
+            masked_frames.append(masked_frame)
+        
+        return masked_frames
+
     def render_results(self):
         def make_gif(frames, gif_name):
             # save to video
@@ -821,6 +886,9 @@ class Runner:
 
         train_frames = self.render_frames(trainloader)
         make_gif(train_frames, "train")
+
+        masked_images = self.mask_frames(trainloader)
+        make_gif(masked_images, "masked")        
 
     @torch.no_grad()
     def render_traj(self, step: int):
