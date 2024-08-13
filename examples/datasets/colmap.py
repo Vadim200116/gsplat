@@ -6,6 +6,7 @@ import imageio.v2 as imageio
 import numpy as np
 import torch
 from pycolmap import SceneManager
+from pathlib import Path
 
 from .normalize import (
     align_principle_axes,
@@ -327,9 +328,19 @@ class CustomDataset(Dataset):
         indices = np.arange(len(self.parser.image_names))
         if val_keyword == "":
             if split == "train":
-                self.indices = indices[indices % self.parser.test_every != 0]
+                train_split_path = Path(self.parser.data_dir) / "train_list.txt"
+                if os.path.exists(train_split_path) and os.path.exists(train_split_path):
+                    train_image_names = set(i.split(".")[0] for i in train_split_path.read_text().splitlines())
+                    self.indices = [idx for idx in indices if self.parser.image_names[idx] in train_image_names]
+                else:                            
+                    self.indices = indices[indices % self.parser.test_every != 0]
             else:
-                self.indices = indices[indices % self.parser.test_every == 0]
+                test_split_path = Path(self.parser.data_dir) / "test_list.txt"
+                if os.path.exists(test_split_path):
+                    test_image_names = set(i.split(".")[0] for i in test_split_path.read_text().splitlines())
+                    self.indices = [idx for idx in indices if self.parser.image_names[idx] in test_image_names]
+                else:
+                    self.indices = indices[indices % self.parser.test_every == 0]
         else:
             if split == "train":
                 self.indices = [idx for idx in indices if not self.parser.image_names[idx].startswith(val_keyword)]
