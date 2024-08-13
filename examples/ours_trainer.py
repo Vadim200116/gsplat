@@ -680,6 +680,9 @@ class Runner:
             if step in [i - 1 for i in cfg.eval_steps]:
                 self.eval(step)
                 self.render_traj(step)
+            
+            if step == max_steps - 1:
+                self.render_results()
 
             if not cfg.disable_viewer:
                 self.viewer.lock.release()
@@ -768,6 +771,55 @@ class Runner:
             self.writer.flush()
 
     @torch.no_grad()
+    def render_frames(self, dataloader):
+        cfg = self.cfg
+        device = self.device
+        val_frames = []
+        for data in dataloader:
+            camtoworlds = data["camtoworld"].to(device)
+            Ks = data["K"].to(device)
+            pixels = data["image"].to(device) / 255.0
+            height, width = pixels.shape[1:3]
+            colors, _, _ = self.rasterize_splats(
+                camtoworlds=camtoworlds,
+                Ks=Ks,
+                width=width,
+                height=height,
+                sh_degree=cfg.sh_degree,
+                near_plane=cfg.near_plane,
+                far_plane=cfg.far_plane,
+            )  # [1, H, W, 3]
+            colors = torch.clamp(colors, 0.0, 1.0)
+            colors_prep = (colors.cpu().numpy() * 255).astype(np.uint8)
+            val_frames.append(colors_prep)
+
+        return val_frames
+
+    def render_results(self):
+        def make_gif(frames, gif_name):
+            # save to video
+            video_dir = f"{self.cfg.result_dir}/gifs"
+            os.makedirs(video_dir, exist_ok=True)
+            writer = imageio.get_writer(f"{video_dir}/{gif_name}.gif", fps=30)
+            for canvas in frames:
+                writer.append_data(canvas)
+            writer.close()
+            print(f"Video saved to {video_dir}/{gif_name}.gif")
+
+        valloader = torch.utils.data.DataLoader(
+            self.valset, batch_size=1, shuffle=False, num_workers=1
+        )
+        trainloader = torch.utils.data.DataLoader(
+            self.trainset, batch_size=1, shuffle=False, num_workers=1
+        )
+
+        val_frames = self.render_frames(valloader)
+        make_gif(val_frames, "val")
+
+        train_frames = self.render_frames(trainloader)
+        make_gif(train_frames, "train")
+
+    @torch.no_grad()
     def render_traj(self, step: int):
         """Entry for trajectory rendering."""
         print("Running trajectory rendering...")
@@ -812,13 +864,13 @@ class Runner:
             canvas_all.append(canvas)
 
         # save to video
-        video_dir = f"{cfg.result_dir}/videos"
+        video_dir = f"{cfg.result_dir}/gifs"
         os.makedirs(video_dir, exist_ok=True)
-        writer = imageio.get_writer(f"{video_dir}/traj_{step}.mp4", fps=30)
+        writer = imageio.get_writer(f"{video_dir}/traj_{step}.gif", fps=30)
         for canvas in canvas_all:
             writer.append_data(canvas)
         writer.close()
-        print(f"Video saved to {video_dir}/traj_{step}.mp4")
+        print(f"Video saved to {video_dir}/traj_{step}.gif")
 
     @torch.no_grad()
     def _viewer_render_fn(
