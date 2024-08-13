@@ -45,7 +45,7 @@ class Config:
     # Every N images there is a test image
     test_every: int = 8
     # Validation frames prefix
-    val_keyword: str = "ref"
+    val_keyword: str = ""
     # Use transient network
     transient: bool = False
     # Random crop size for training  (experimental)

@@ -318,7 +318,7 @@ class CustomDataset(Dataset):
         split: str = "train",
         patch_size: Optional[int] = None,
         load_depths: bool = False,
-        val_keyword: str = "ref",
+        val_keyword: str = "",
     ):
         super().__init__(
         parser,
