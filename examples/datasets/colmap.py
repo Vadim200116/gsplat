@@ -310,6 +310,33 @@ class Dataset:
         return data
 
 
+class CustomDataset(Dataset):
+    def __init__(
+        self,
+        parser: Parser,
+        split: str = "train",
+        patch_size: Optional[int] = None,
+        load_depths: bool = False,
+        val_keyword: str = "ref",
+    ):
+        super().__init__(
+        parser,
+        split,
+        patch_size,
+        load_depths,)
+        indices = np.arange(len(self.parser.image_names))
+        if val_keyword == "":
+            if split == "train":
+                self.indices = indices[indices % self.parser.test_every != 0]
+            else:
+                self.indices = indices[indices % self.parser.test_every == 0]
+        else:
+            if split == "train":
+                self.indices = [idx for idx in indices if not self.parser.image_names[idx].startswith(val_keyword)]
+            else:
+                self.indices = [idx for idx in indices if self.parser.image_names[idx].startswith(val_keyword)]
+
+
 if __name__ == "__main__":
     import argparse
 

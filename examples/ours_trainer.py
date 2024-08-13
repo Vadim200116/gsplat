@@ -24,7 +24,7 @@ from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMe
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from typing_extensions import assert_never
 
-from datasets.colmap import Dataset, Parser
+from datasets.colmap import Dataset, Parser, CustomDataset
 from datasets.traj import generate_interpolated_path
 from utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_random_seed
 
@@ -44,6 +44,8 @@ class Config:
     result_dir: str = "results/garden"
     # Every N images there is a test image
     test_every: int = 8
+    # Validation frames prefix
+    val_keyword: str = "ref"
     # Random crop size for training  (experimental)
     patch_size: Optional[int] = None
     # A global scaler that applies to the scene size related parameters
@@ -266,13 +268,14 @@ class Runner:
             normalize=True,
             test_every=cfg.test_every,
         )
-        self.trainset = Dataset(
+        self.trainset = CustomDataset(
             self.parser,
             split="train",
             patch_size=cfg.patch_size,
             load_depths=cfg.depth_loss,
+            val_keyword=cfg.val_keyword,
         )
-        self.valset = Dataset(self.parser, split="val")
+        self.valset = CustomDataset(self.parser, split="val", val_keyword=cfg.val_keyword)
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
         print("Scene scale:", self.scene_scale)
 
