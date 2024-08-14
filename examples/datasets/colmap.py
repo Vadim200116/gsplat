@@ -331,14 +331,14 @@ class CustomDataset(Dataset):
                 train_split_path = Path(self.parser.data_dir) / "train_list.txt"
                 if os.path.exists(train_split_path) and os.path.exists(train_split_path):
                     train_image_names = set(i.split(".")[0] for i in train_split_path.read_text().splitlines())
-                    self.indices = [idx for idx in indices if self.parser.image_names[idx] in train_image_names]
+                    self.indices = [idx for idx in indices if self.parser.image_names[idx].split(".")[0] in train_image_names]
                 else:                            
                     self.indices = indices[indices % self.parser.test_every != 0]
             else:
                 test_split_path = Path(self.parser.data_dir) / "test_list.txt"
                 if os.path.exists(test_split_path):
                     test_image_names = set(i.split(".")[0] for i in test_split_path.read_text().splitlines())
-                    self.indices = [idx for idx in indices if self.parser.image_names[idx] in test_image_names]
+                    self.indices = [idx for idx in indices if self.parser.image_names[idx].split(".")[0] in test_image_names]
                 else:
                     self.indices = indices[indices % self.parser.test_every == 0]
         else:
