@@ -13,13 +13,13 @@ import torch.nn.functional as F
 import tqdm
 import tyro
 import viser
-from datasets.colmap import Dataset, Parser
+from datasets.colmap import Dataset, Parser, CustomDataset
 from datasets.traj import generate_interpolated_path
 from torch import Tensor
 from torch.utils.tensorboard import SummaryWriter
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
-from utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_random_seed
+from utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_random_seed, TransientModule, ssim, l1_loss
 
 from gsplat.rendering import rasterization
 from gsplat.strategy import DefaultStrategy
@@ -40,6 +40,10 @@ class Config:
     result_dir: str = "results/garden"
     # Every N images there is a test image
     test_every: int = 8
+    # Validation frames prefix
+    val_keyword: str = ""
+    # Use transient network
+    transient: bool = False
     # Random crop size for training  (experimental)
     patch_size: Optional[int] = None
     # A global scaler that applies to the scene size related parameters
@@ -76,6 +80,10 @@ class Config:
     init_scale: float = 1.0
     # Weight for SSIM loss
     ssim_lambda: float = 0.2
+    # enable alpha scheduling
+    schedule: bool = True
+    # alpha sampling schedule rate (higher more robust)
+    schedule_beta: float = -3e-3
 
     # Near plane clipping distance
     near_plane: float = 0.01
@@ -141,6 +149,9 @@ class Config:
     tb_every: int = 100
     # Save training images to tensorboard
     tb_save_image: bool = False
+
+    # FPS of rendered gif
+    fps: int = 30
 
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
@@ -251,13 +262,14 @@ class Runner:
             normalize=True,
             test_every=cfg.test_every,
         )
-        self.trainset = Dataset(
+        self.trainset = CustomDataset(
             self.parser,
             split="train",
             patch_size=cfg.patch_size,
             load_depths=cfg.depth_loss,
+            val_keyword=cfg.val_keyword,
         )
-        self.valset = Dataset(self.parser, split="val")
+        self.valset = CustomDataset(self.parser, split="val", val_keyword=cfg.val_keyword)
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
         print("Scene scale:", self.scene_scale)
 
@@ -334,8 +346,18 @@ class Runner:
                 ),
             ]
 
+        if cfg.transient:
+            self.transient_module = TransientModule().cuda()
+
+            self.transient_optimizers = [torch.optim.Adam(
+                self.transient_module.parameters(), lr=1e-5,
+            )]
+            self.transient_loss = lambda weights, l1: torch.mean(
+                ((1-weights) * l1).mean() + 0.1 * torch.abs(weights).mean()
+            )
+
         # Losses & Metrics.
-        self.ssim = StructuralSimilarityIndexMeasure(data_range=1.0).to(self.device)
+        self.ssim = ssim
         self.psnr = PeakSignalNoiseRatio(data_range=1.0).to(self.device)
         self.lpips = LearnedPerceptualImagePatchSimilarity(normalize=True).to(
             self.device
@@ -435,6 +457,8 @@ class Runner:
         # Training loop.
         global_tic = time.time()
         pbar = tqdm.tqdm(range(init_step, max_steps))
+        if cfg.transient:
+            self.transient_module.train()
         for step in pbar:
             if not cfg.disable_viewer:
                 while self.viewer.state.status == "paused":
@@ -498,13 +522,30 @@ class Runner:
                 step=step,
                 info=info,
             )
-
-            # loss
-            l1loss = F.l1_loss(colors, pixels)
+            l1loss = l1_loss(colors, pixels).permute(0, 3, 1, 2)
             ssimloss = 1.0 - self.ssim(
-                pixels.permute(0, 3, 1, 2), colors.permute(0, 3, 1, 2)
+                pixels.permute(0, 3, 1, 2), colors.permute(0, 3, 1, 2), size_average=False
             )
-            loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
+
+            if cfg.transient:
+                weights = self.transient_module(pixels.permute(0, 3, 1, 2))
+                pred_mask = (weights.clone().detach() > 0.5).float()
+
+                if cfg.schedule:
+                    # schedule sampling of the mask based on alpha
+                    alpha = np.exp(cfg.schedule_beta * np.floor((1 + step) / 1.5))
+                    pred_mask = 1 - torch.bernoulli(
+                        torch.clip(alpha + (1 - alpha) * (1-pred_mask.clone().detach()),
+                        min=0.0, max=1.0))
+
+                l1loss *= (1 - pred_mask)
+                ssimloss *= (1 - pred_mask)
+
+                diff = torch.abs(colors.detach() - pixels)
+                transient_loss = self.transient_loss(weights, diff.permute(0, 3, 1, 2))
+                transient_loss.backward()
+
+            loss = (l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda).mean()
             if cfg.depth_loss:
                 # query depths from depth map
                 points = torch.stack(
@@ -526,6 +567,9 @@ class Runner:
                 loss += depthloss * cfg.depth_lambda
 
             loss.backward()
+
+            l1loss = l1loss.mean()
+            ssimloss = ssimloss.mean()
 
             desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
             if cfg.depth_loss:
@@ -584,6 +628,10 @@ class Runner:
             for optimizer in self.app_optimizers:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
+            if cfg.transient:
+                for optimizer in self.transient_optimizers:
+                    optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
             for scheduler in schedulers:
                 scheduler.step()
 
@@ -610,6 +658,9 @@ class Runner:
             if step in [i - 1 for i in cfg.eval_steps] or step == max_steps - 1:
                 self.eval(step)
                 self.render_traj(step)
+
+            if step == max_steps - 1:
+                self.render_results()
 
             if not cfg.disable_viewer:
                 self.viewer.lock.release()
@@ -692,6 +743,83 @@ class Runner:
             self.writer.add_scalar(f"val/{k}", v, step)
         self.writer.flush()
 
+
+    @torch.no_grad()
+    def render_frames(self, dataloader):
+        cfg = self.cfg
+        device = self.device
+        val_frames = []
+        for data in dataloader:
+            camtoworlds = data["camtoworld"].to(device)
+            Ks = data["K"].to(device)
+            pixels = data["image"].to(device) / 255.0
+            height, width = pixels.shape[1:3]
+            colors, _, _ = self.rasterize_splats(
+                camtoworlds=camtoworlds,
+                Ks=Ks,
+                width=width,
+                height=height,
+                sh_degree=cfg.sh_degree,
+                near_plane=cfg.near_plane,
+                far_plane=cfg.far_plane,
+            )  # [1, H, W, 3]
+            colors = torch.clamp(colors, 0.0, 1.0)
+            colors_prep = (colors.cpu().numpy() * 255).astype(np.uint8)
+            val_frames.append(colors_prep)
+
+        return val_frames
+
+    def mask_frames(self, dataloader):
+        def mask_frame(frame, mask):
+            mask_ = np.expand_dims(np.array(mask.detach().cpu().numpy()), 2).repeat(3, axis=2)
+            h,w = frame.shape[:2]
+            green = np.zeros([h, w, 3]) 
+            green[:,:,1] = 255
+            alpha = 0.6
+            fuse_img = (1-alpha)*frame + alpha*green
+            fuse_img = mask_ * fuse_img + (1-mask_)*frame
+
+            return fuse_img.astype(np.uint8)
+
+        masked_frames = []
+        self.transient_module.eval()
+        for data in dataloader:
+            pixels = (data["image"].to(self.device) / 255.0).permute(0, 3, 1, 2)
+            weights = self.transient_module(pixels)
+            mask = (weights > 0.5).float()
+            masked_frame = mask_frame(data["image"].squeeze().numpy(), mask)
+            masked_frames.append(masked_frame)
+
+        return masked_frames
+
+    def render_results(self):
+        def make_gif(frames, gif_name):
+            # save to video
+            video_dir = f"{self.cfg.result_dir}/gifs"
+            os.makedirs(video_dir, exist_ok=True)
+            writer = imageio.get_writer(f"{video_dir}/{gif_name}.gif", fps=self.cfg.fps)
+            for canvas in frames:
+                writer.append_data(canvas)
+            writer.close()
+            print(f"Video saved to {video_dir}/{gif_name}.gif")
+
+        valloader = torch.utils.data.DataLoader(
+            self.valset, batch_size=1, shuffle=False, num_workers=1
+        )
+        trainloader = torch.utils.data.DataLoader(
+            self.trainset, batch_size=1, shuffle=False, num_workers=1
+        )
+
+        val_frames = self.render_frames(valloader)
+        make_gif(val_frames, "val")
+
+        train_frames = self.render_frames(trainloader)
+        make_gif(train_frames, "train")
+
+        masked_images = self.mask_frames(trainloader)
+        make_gif(masked_images, "masked")        
+
+
     @torch.no_grad()
     def render_traj(self, step: int):
         """Entry for trajectory rendering."""
@@ -712,7 +840,7 @@ class Runner:
         camtoworlds = torch.from_numpy(camtoworlds).float().to(device)
         K = torch.from_numpy(list(self.parser.Ks_dict.values())[0]).float().to(device)
         width, height = list(self.parser.imsize_dict.values())[0]
-
+        print(width, height)
         canvas_all = []
         for i in tqdm.trange(len(camtoworlds), desc="Rendering trajectory"):
             renders, _, _ = self.rasterize_splats(
@@ -737,13 +865,13 @@ class Runner:
             canvas_all.append(canvas)
 
         # save to video
-        video_dir = f"{cfg.result_dir}/videos"
+        video_dir = f"{cfg.result_dir}/gifs"
         os.makedirs(video_dir, exist_ok=True)
-        writer = imageio.get_writer(f"{video_dir}/traj_{step}.mp4", fps=30)
+        writer = imageio.get_writer(f"{video_dir}/traj_{step}.gif", fps=30)
         for canvas in canvas_all:
             writer.append_data(canvas)
         writer.close()
-        print(f"Video saved to {video_dir}/traj_{step}.mp4")
+        print(f"Video saved to {video_dir}/traj_{step}.gif")
 
     @torch.no_grad()
     def _viewer_render_fn(
