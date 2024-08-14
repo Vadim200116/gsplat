@@ -157,8 +157,8 @@ def set_random_seed(seed: int):
 
 
 def pad_and_unpad(func):
-    def wrapper(x):
-        width, height = x.shape[1:]
+    def wrapper(self, x):
+        width, height = x.shape[2:]
         target_width = (width + 31) // 32 * 32
         target_height = (height + 31) // 32 * 32
 
@@ -171,7 +171,7 @@ def pad_and_unpad(func):
                             (pad_height_top, pad_height_bottom, pad_width_left, pad_width_right), 
                             mode='replicate')
 
-        weights = func(padded_input.unsqueeze(0)).squeeze()
+        weights = func(self, padded_input).squeeze()
         rec_weights = weights[pad_width_left: pad_width_left + width, pad_height_top: pad_height_top + height]
 
         return rec_weights
