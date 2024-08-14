@@ -7,6 +7,7 @@ import numpy as np
 import torch
 from pycolmap import SceneManager
 from pathlib import Path
+from PIL import Image
 
 from .normalize import (
     align_principle_axes,
@@ -60,6 +61,22 @@ class Parser:
         params_dict = dict()
         imsize_dict = dict()  # width, height
         bottom = np.array([0, 0, 0, 1]).reshape(1, 4)
+
+        # Load images.
+        colmap_image_dir = os.path.join(data_dir, "images")
+        if not os.path.exists(colmap_image_dir):
+            raise ValueError(f"Image folder {colmap_image_dir} does not exist.")
+        downsample = False
+        if factor > 1:
+            image_dir_suffix = f"_{factor}"
+            image_dir = os.path.join(data_dir, "images" + image_dir_suffix)
+            if not os.path.exists(image_dir):
+                print("downsampling and saving the images.")
+                downsample = True
+                os.makedirs(image_dir)
+        else:
+            image_dir = colmap_image_dir
+
         for k in imdata:
             im = imdata[k]
             rot = im.R()
@@ -106,6 +123,12 @@ class Parser:
 
             # image size
             imsize_dict[camera_id] = (cam.width // factor, cam.height // factor)
+            if downsample:
+                im_path = os.path.join(colmap_image_dir, im.name)
+                im_rgb = Image.open(im_path)
+                resize_im = im_rgb.resize(imsize_dict[camera_id])
+                out_path = os.path.join(image_dir, im.name)
+                resize_im.save(out_path)
 
         print(
             f"[Parser] {len(imdata)} images, taken by {len(set(camera_ids))} cameras."
@@ -132,16 +155,6 @@ class Parser:
         camtoworlds = camtoworlds[inds]
         camera_ids = [camera_ids[i] for i in inds]
 
-        # Load images.
-        if factor > 1:
-            image_dir_suffix = f"_{factor}"
-        else:
-            image_dir_suffix = ""
-        colmap_image_dir = os.path.join(data_dir, "images")
-        image_dir = os.path.join(data_dir, "images" + image_dir_suffix)
-        for d in [image_dir, colmap_image_dir]:
-            if not os.path.exists(d):
-                raise ValueError(f"Image folder {d} does not exist.")
 
         # Downsampled images may have different names vs images used for COLMAP,
         # so we need to map between the two sorted lists of files.
