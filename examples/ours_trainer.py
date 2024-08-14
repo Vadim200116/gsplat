@@ -309,9 +309,7 @@ class Runner:
         self.cfg.strategy.check_sanity(self.splats, self.optimizers)
 
         if isinstance(self.cfg.strategy, DefaultStrategy):
-            self.strategy_state = self.cfg.strategy.initialize_state(
-                scene_scale=self.scene_scale
-            )
+            self.strategy_state = self.cfg.strategy.initialize_state()
         elif isinstance(self.cfg.strategy, MCMCStrategy):
             self.strategy_state = self.cfg.strategy.initialize_state()
         else:
@@ -360,7 +358,7 @@ class Runner:
             if world_size > 1:
                 self.app_module = DDP(self.app_module)
 
-        if self.transient:
+        if cfg.transient:
             self.transient_module = TransientModule().cuda()
 
         self.transient_optimizers = [torch.optim.Adam(
