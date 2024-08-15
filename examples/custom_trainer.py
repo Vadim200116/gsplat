@@ -80,10 +80,17 @@ class Config:
     init_scale: float = 1.0
     # Weight for SSIM loss
     ssim_lambda: float = 0.2
+    # Robust loss percentile for threshold
+    robust_percentile: float = 0.7
     # enable alpha scheduling
     schedule: bool = True
     # alpha sampling schedule rate (higher more robust)
     schedule_beta: float = -3e-3
+    # Thresholds for mlp mask supervision
+    lower_bound: float = 0.5
+    upper_bound: float = 0.9
+    # bin size for the error hist for robust threshold
+    bin_size: int = 10000
 
     # Near plane clipping distance
     near_plane: float = 0.01
@@ -151,7 +158,7 @@ class Config:
     tb_save_image: bool = False
 
     # FPS of rendered gif
-    fps: int = 30
+    fps: int = 2
 
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
@@ -310,6 +317,13 @@ class Runner:
         self.strategy.check_sanity(self.splats, self.optimizers)
         self.strategy_state = self.strategy.initialize_state()
 
+        self.running_stats = {
+            "hist_err": torch.zeros((cfg.bin_size,)),
+            "avg_err": 1.0, 
+            "lower_err": 0.0, 
+            "upper_err": 1.0, 
+        }
+
         self.pose_optimizers = []
         if cfg.pose_opt:
             self.pose_adjust = CameraOptModule(len(self.trainset)).to(self.device)
@@ -352,9 +366,9 @@ class Runner:
             self.transient_optimizers = [torch.optim.Adam(
                 self.transient_module.parameters(), lr=1e-5,
             )]
-            self.transient_loss = lambda weights, l1: torch.mean(
-                ((1-weights) * l1).mean() + 0.1 * torch.abs(weights).mean()
-            )
+            self.transient_loss = lambda p, minimum, maximum: torch.mean(
+      		    torch.nn.ReLU()(p - minimum) + torch.nn.ReLU()(maximum - p)
+      		)
 
         # Losses & Metrics.
         self.ssim = ssim
@@ -418,6 +432,42 @@ class Runner:
             **kwargs,
         )
         return render_colors, render_alphas, info
+
+    def robust_mask(self, error_per_pixel: torch.Tensor, loss_threshold: float) -> torch.Tensor:
+        epsilon = 1e-3
+        error_per_pixel = error_per_pixel.mean(axis=-1, keepdims=True)
+        error_per_pixel = error_per_pixel.squeeze(-1).unsqueeze(0)
+        is_inlier_pixel = (error_per_pixel < loss_threshold).float()
+        window_size = 3
+        channel = 1
+        window = torch.ones((1, 1, window_size, window_size),
+                dtype=torch.float) / (window_size * window_size)
+        if error_per_pixel.is_cuda:
+            window = window.cuda(error_per_pixel.get_device())
+        window = window.type_as(error_per_pixel)
+        has_inlier_neighbors = F.conv2d(
+                is_inlier_pixel, window, padding=window_size // 2, groups=channel)
+        has_inlier_neighbors = (has_inlier_neighbors > 0.5).float()
+        is_inlier_pixel = ((has_inlier_neighbors + is_inlier_pixel) > epsilon).float()
+        pred_mask = is_inlier_pixel.squeeze(0).unsqueeze(-1)
+        return pred_mask
+
+    def update_running_stats(self, info):
+        cfg = self.cfg
+
+        self.running_stats["hist_err"] = 0.95 * self.running_stats["hist_err"] + info["err"]
+        mid_err = torch.sum(self.running_stats["hist_err"]) * cfg.robust_percentile 
+        self.running_stats["avg_err"] = torch.linspace(0, 1, cfg.bin_size+1)[
+                torch.where(torch.cumsum(self.running_stats["hist_err"], 0) >= mid_err)[0][0]]
+
+        lower_err = torch.sum(self.running_stats["hist_err"]) * cfg.lower_bound
+        upper_err = torch.sum(self.running_stats["hist_err"]) * cfg.upper_bound
+
+        self.running_stats["lower_err"] = torch.linspace(0, 1, cfg.bin_size + 1)[
+                torch.where(torch.cumsum(self.running_stats["hist_err"], 0) >= lower_err)[0][0]]
+        self.running_stats["upper_err"] = torch.linspace(0, 1, cfg.bin_size + 1)[
+                torch.where(torch.cumsum(self.running_stats["hist_err"], 0) >= upper_err)[0][0]]
+
 
     def train(self):
         cfg = self.cfg
@@ -534,15 +584,18 @@ class Runner:
                 if cfg.schedule:
                     # schedule sampling of the mask based on alpha
                     alpha = np.exp(cfg.schedule_beta * np.floor((1 + step) / 1.5))
-                    pred_mask = 1 - torch.bernoulli(
-                        torch.clip(alpha + (1 - alpha) * (1-pred_mask.clone().detach()),
+                    pred_mask = torch.bernoulli(
+                        torch.clip(alpha + (1 - alpha) * pred_mask.clone().detach(),
                         min=0.0, max=1.0))
 
-                l1loss *= (1 - pred_mask)
-                ssimloss *= (1 - pred_mask)
+                l1loss *= pred_mask
+                ssimloss *= pred_mask
 
                 diff = torch.abs(colors.detach() - pixels)
-                transient_loss = self.transient_loss(weights, diff.permute(0, 3, 1, 2))
+                lower_mask = self.robust_mask(diff, self.running_stats["lower_err"])
+                upper_mask = self.robust_mask(diff, self.running_stats["upper_err"])
+
+                transient_loss = self.transient_loss(weights.flatten(), upper_mask.flatten(), lower_mask.flatten())
                 transient_loss.backward()
 
             loss = (l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda).mean()
@@ -595,6 +648,13 @@ class Runner:
                     self.writer.add_image("train/render", canvas, step)
                 self.writer.flush()
 
+            info["err"] = torch.histogram(
+                    torch.mean(torch.abs(
+                        colors - pixels), dim=-3).clone().detach().cpu(),
+                    bins=cfg.bin_size,
+                    range=(0.0, 1.0),
+                    )[0]
+
             self.strategy.step_post_backward(
                 params=self.splats,
                 optimizers=self.optimizers,
@@ -602,6 +662,7 @@ class Runner:
                 step=step,
                 info=info,
             )
+            self.update_running_stats(info)
 
             # Turn Gradients into Sparse Tensor before running optimizer
             if cfg.sparse_grad:
@@ -652,6 +713,10 @@ class Runner:
                         "splats": self.splats.state_dict(),
                     },
                     f"{self.ckpt_dir}/ckpt_{step}.pt",
+                )
+                torch.save(
+                    self.transient_module.state_dict(),
+                    f"{self.ckpt_dir}/transient_{step}.pt"
                 )
 
             # eval the full set
@@ -776,8 +841,8 @@ class Runner:
             green = np.zeros([h, w, 3]) 
             green[:,:,1] = 255
             alpha = 0.6
-            fuse_img = (1-alpha)*frame + alpha*green
-            fuse_img = mask_ * fuse_img + (1-mask_)*frame
+            fuse_img = (1-alpha) * frame + alpha * green
+            fuse_img = (1-mask_) * fuse_img + mask_ * frame
 
             return fuse_img.astype(np.uint8)
 
