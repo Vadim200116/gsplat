@@ -176,6 +176,9 @@ class Config:
     # Save training images to tensorboard
     tb_save_image: bool = False
 
+    # FPS of rendered gif
+    fps: int = 2
+
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
         self.save_steps = [int(i * factor) for i in self.save_steps]
@@ -858,6 +861,9 @@ class Runner:
                 self.eval(step)
                 self.render_traj(step)
 
+            if step == max_steps - 1:
+                self.render_results()
+
             if not cfg.disable_viewer:
                 self.viewer.lock.release()
                 num_train_steps_per_sec = 1.0 / (time.time() - tic)
@@ -1162,6 +1168,168 @@ class Runner:
             self.writer.add_scalar(f"val/{k}", v, step)
         self.writer.flush()
 
+
+    @torch.no_grad()
+    def render_frames(self, dataloader):
+        cfg = self.cfg
+        device = self.device
+        val_frames = []
+        for data in dataloader:
+            camtoworlds = data["camtoworld"].to(device)
+            Ks = data["K"].to(device)
+            pixels = data["image"].to(device) / 255.0
+            height, width = pixels.shape[1:3]
+            colors, _, _ = self.rasterize_splats(
+                camtoworlds=camtoworlds,
+                Ks=Ks,
+                width=width,
+                height=height,
+                sh_degree=cfg.sh_degree,
+                near_plane=cfg.near_plane,
+                far_plane=cfg.far_plane,
+            )  # [1, H, W, 3]
+            colors = torch.clamp(colors, 0.0, 1.0)
+            colors_prep = (colors.cpu().numpy() * 255).astype(np.uint8)
+            val_frames.append(colors_prep)
+
+        return val_frames
+
+    def mask_frames(self, dataloader):
+        def mask_frame(frame, mask):
+            mask_ = np.expand_dims(np.array(mask.detach().cpu().numpy()), 2).repeat(3, axis=2)
+            h,w = frame.shape[:2]
+            green = np.zeros([h, w, 3]) 
+            green[:,:,1] = 255
+            alpha = 0.6
+            fuse_img = (1-alpha) * frame + alpha * green
+            fuse_img = (1-mask_) * fuse_img + mask_ * frame
+
+            return fuse_img.astype(np.uint8)
+
+        masked_frames = []
+        device = self.device
+        for data in dataloader:
+            pixels = (data["image"].to(device) / 255.0)
+            if self.cfg.semantics:
+                sf = data["semantics"].to(device)
+                sf = nn.Upsample(
+                    size=(pixels.shape[1], pixels.shape[2]),
+                    mode="bilinear",
+                )(sf).squeeze(0)
+                pos_enc = get_positional_encodings(
+                    pixels.shape[1], pixels.shape[2], 20
+                ).permute((2, 0, 1))
+                sf = torch.cat([sf, pos_enc], dim=0)
+                sf_flat = sf.reshape(sf.shape[0], -1).permute((1, 0))
+                self.spotless_module.eval()
+                pred_mask_up = self.spotless_module(sf_flat)
+                mask = pred_mask_up.reshape(pixels.shape[1], pixels.shape[2])
+            else:
+                camtoworlds = data["camtoworld"].to(device)
+                Ks = data["K"].to(device)
+                height, width = pixels.shape[1:3]
+                colors, _, _ = self.rasterize_splats(
+                    camtoworlds=camtoworlds,
+                    Ks=Ks,
+                    width=width,
+                    height=height,
+                    sh_degree=cfg.sh_degree,
+                    near_plane=cfg.near_plane,
+                    far_plane=cfg.far_plane,
+                )  # [1, H, W, 3]
+                colors = torch.clamp(colors, 0.0, 1.0)
+
+                error_per_pixel = torch.abs(colors - pixels)
+                mask = self.robust_mask(
+                    error_per_pixel, self.running_stats["avg_err"]
+                ).reshape(pixels.shape[1], pixels.shape[2])
+
+            masked_frame = mask_frame(data["image"].squeeze().numpy(), mask)
+            masked_frames.append(masked_frame)
+
+        return masked_frames
+
+    def render_results(self):
+        def make_gif(frames, gif_name):
+            # save to video
+            video_dir = f"{self.cfg.result_dir}/gifs"
+            os.makedirs(video_dir, exist_ok=True)
+            writer = imageio.get_writer(f"{video_dir}/{gif_name}.gif", fps=self.cfg.fps)
+            for canvas in frames:
+                writer.append_data(canvas)
+            writer.close()
+            print(f"Video saved to {video_dir}/{gif_name}.gif")
+
+        valloader = torch.utils.data.DataLoader(
+            self.valset, batch_size=1, shuffle=False, num_workers=1
+        )
+        trainloader = torch.utils.data.DataLoader(
+            self.trainset, batch_size=1, shuffle=False, num_workers=1
+        )
+
+        val_frames = self.render_frames(valloader)
+        make_gif(val_frames, "val")
+
+        train_frames = self.render_frames(trainloader)
+        make_gif(train_frames, "train")
+
+        masked_images = self.mask_frames(trainloader)
+        make_gif(masked_images, "masked")        
+
+
+    @torch.no_grad()
+    def render_traj(self, step: int):
+        """Entry for trajectory rendering."""
+        print("Running trajectory rendering...")
+        cfg = self.cfg
+        device = self.device
+
+        camtoworlds = self.parser.camtoworlds[5:-5]
+        camtoworlds = generate_interpolated_path(camtoworlds, 1)  # [N, 3, 4]
+        camtoworlds = np.concatenate(
+            [
+                camtoworlds,
+                np.repeat(np.array([[[0.0, 0.0, 0.0, 1.0]]]), len(camtoworlds), axis=0),
+            ],
+            axis=1,
+        )  # [N, 4, 4]
+
+        camtoworlds = torch.from_numpy(camtoworlds).float().to(device)
+        K = torch.from_numpy(list(self.parser.Ks_dict.values())[0]).float().to(device)
+        width, height = list(self.parser.imsize_dict.values())[0]
+        print(width, height)
+        canvas_all = []
+        for i in tqdm.trange(len(camtoworlds), desc="Rendering trajectory"):
+            renders, _, _ = self.rasterize_splats(
+                camtoworlds=camtoworlds[i : i + 1],
+                Ks=K[None],
+                width=width,
+                height=height,
+                sh_degree=cfg.sh_degree,
+                near_plane=cfg.near_plane,
+                far_plane=cfg.far_plane,
+                render_mode="RGB+ED",
+            )  # [1, H, W, 4]
+            colors = torch.clamp(renders[0, ..., 0:3], 0.0, 1.0)  # [H, W, 3]
+            depths = renders[0, ..., 3:4]  # [H, W, 1]
+            depths = (depths - depths.min()) / (depths.max() - depths.min())
+
+            # write images
+            canvas = torch.cat(
+                [colors, depths.repeat(1, 1, 3)], dim=0 if width > height else 1
+            )
+            canvas = (canvas.cpu().numpy() * 255).astype(np.uint8)
+            canvas_all.append(canvas)
+
+        # save to video
+        video_dir = f"{cfg.result_dir}/gifs"
+        os.makedirs(video_dir, exist_ok=True)
+        writer = imageio.get_writer(f"{video_dir}/traj_{step}.gif", fps=30)
+        for canvas in canvas_all:
+            writer.append_data(canvas)
+        writer.close()
+        print(f"Video saved to {video_dir}/traj_{step}.gif")
+
     @torch.no_grad()
     def render_traj(self, step: int):
         """Entry for trajectory rendering."""
@@ -1211,7 +1379,7 @@ class Runner:
             canvas_all.append(canvas)
 
         # save to video
-        video_dir = f"{cfg.result_dir}/videos"
+        video_dir = f"{cfg.result_dir}/gifs"
         os.makedirs(video_dir, exist_ok=True)
         writer = imageio.get_writer(f"{video_dir}/traj_{step}.gif", fps=30)
         for canvas in canvas_all:
