@@ -1,0 +1,1 @@
+python3 examples/custom_trainer.py --data_dir /data/kaust/scene_3+scene_3_empty/ --data_factor 1 --result_dir /data/output/gsplat/kaust/scene_3  --transient --schedule_beta -0.001 --fps 8 --val_keyword ref
