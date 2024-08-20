@@ -855,6 +855,11 @@ class Runner:
                     },
                     f"{self.ckpt_dir}/ckpt_{step}.pt",
                 )
+                if self.cfg.semantics and not self.cfg.cluster:
+                    torch.save(
+                        self.spotless_module.state_dict(),
+                        f"{self.ckpt_dir}/spotless_module_{step}.pt"
+                    )
 
             # eval the full set
             if step in [i - 1 for i in cfg.eval_steps] or step == max_steps - 1:
