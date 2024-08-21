@@ -32,7 +32,7 @@ from utils import (
 )
 
 from gsplat.rendering import rasterization
-
+from torchvision.transforms.functional import gaussian_blur
 
 @dataclass
 class Config:
@@ -689,8 +689,13 @@ class Runner:
                 spot_loss.backward()
 
             # Pass the error histogram for capturing error statistics
+
+            kernel = (35, 35)
+            colors_blurred = gaussian_blur(colors[0].permute(2, 0, 1), kernel)
+            pixels_blurred = gaussian_blur(pixels[0].permute(2, 0, 1), kernel)
+
             info["err"] = torch.histogram(
-                torch.mean(torch.abs(colors - pixels), dim=-3).clone().detach().cpu(),
+                torch.mean(torch.abs(colors_blurred - pixels_blurred), dim=0).clone().detach().cpu(),
                 bins=cfg.bin_size,
                 range=(0.0, 1.0),
             )[0]
