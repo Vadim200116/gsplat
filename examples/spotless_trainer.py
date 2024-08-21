@@ -382,9 +382,9 @@ class Runner:
                     lr=1e-3,
                 )
             ]
-            self.spotless_loss = lambda weights, l1: torch.mean(
-                (weights * l1).mean() + 0.1 * torch.abs(1-weights).mean()
-        )
+            self.spotless_loss = lambda p, minimum, maximum: torch.mean(
+                torch.nn.ReLU()(p - minimum) + torch.nn.ReLU()(maximum - p)
+            )
 
         # Losses & Metrics.
         self.ssim = StructuralSimilarityIndexMeasure(data_range=1.0).to(self.device)
@@ -634,7 +634,13 @@ class Runner:
                         pred_mask = pred_mask_up.reshape(
                             1, colors.shape[1], colors.shape[2], 1
                         )
-
+                        # calculate lower and upper bound masks for spotless mlp loss
+                        lower_mask = self.robust_mask(
+                            error_per_pixel, self.running_stats["lower_err"]
+                        )
+                        upper_mask = self.robust_mask(
+                            error_per_pixel, self.running_stats["upper_err"]
+                        )
                 log_pred_mask = pred_mask.clone()
                 if cfg.schedule:
                     # schedule sampling of the mask based on alpha
@@ -676,10 +682,10 @@ class Runner:
             if self.mlp_spotless:
                 self.spotless_module.train()
                 spot_loss = self.spotless_loss(
-                    pred_mask_up.reshape(
-                        colors.shape[1], colors.shape[2]),
-                        error_per_pixel.detach().permute(0, 3, 1, 2).squeeze(),
-                    )
+                    pred_mask_up.flatten(), upper_mask.flatten(), lower_mask.flatten()
+                )
+                reg = 0.5 * self.spotless_module.get_regularizer()
+                spot_loss = spot_loss + reg
                 spot_loss.backward()
 
             # Pass the error histogram for capturing error statistics
