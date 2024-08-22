@@ -14,13 +14,13 @@ from torch import nn
 import tqdm
 import tyro
 import viser
-from datasets.colmap import Dataset, Parser, CustomDataset, ClutterDataset
+from datasets.colmap import Dataset, Parser, CustomDataset, ClutterDataset, SemanticParser
 from datasets.traj import generate_interpolated_path
 from torch import Tensor
 from torch.utils.tensorboard import SummaryWriter
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
-from utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_random_seed, TransientModule, ssim, l1_loss, SpotlessModule, get_positional_encodings
+from utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_random_seed, TransientModule, ssim, l1_loss, SpotLessModule, get_positional_encodings
 
 from gsplat.rendering import rasterization
 from gsplat.strategy import DefaultStrategy
@@ -46,6 +46,9 @@ class Config:
     val_keyword: str = ""
     # Use transient network
     transient: bool = False
+    # Train and test image name keywords
+    train_keyword: str = "clutter"
+    test_keyword: str = "extra"
     # Whether to use semantics
     semantics: bool = True
     # Random crop size for training  (experimental)
@@ -92,7 +95,7 @@ class Config:
     # enable alpha scheduling
     schedule: bool = True
     # alpha sampling schedule rate (higher more robust)
-    schedule_beta: float = -3e-3
+    schedule_beta: float = -1e-3
     # Thresholds for mlp mask supervision
     lower_bound: float = 0.5
     upper_bound: float = 0.9
@@ -270,12 +273,21 @@ class Runner:
         self.writer = SummaryWriter(log_dir=f"{cfg.result_dir}/tb")
 
         # Load data: Training data should contain initial points and colors.
-        self.parser = Parser(
-            data_dir=cfg.data_dir,
-            factor=cfg.data_factor,
-            normalize=True,
-            test_every=cfg.test_every,
-        )
+        if cfg.semantics:
+            self.parser = SemanticParser(
+                data_dir=cfg.data_dir,
+                factor=cfg.data_factor,
+                normalize=True,
+                load_keyword=cfg.train_keyword,
+                cluster=False,
+            )
+        else:
+            self.parser = Parser(
+                data_dir=cfg.data_dir,
+                factor=cfg.data_factor,
+                normalize=True,
+                test_every=cfg.test_every,
+            )
         self.trainset = ClutterDataset(
             self.parser,
             split="train",
@@ -377,7 +389,7 @@ class Runner:
 
         if cfg.transient:
             if cfg.semantics:
-                self.transient_module = SpotlessModule(
+                self.transient_module = SpotLessModule(
                     num_classes=1, num_features=self.trainset[0]["semantics"].shape[0] + 80
                 ).cuda()
                 self.transient_optimizers = [torch.optim.Adam(
@@ -532,8 +544,6 @@ class Runner:
         # Training loop.
         global_tic = time.time()
         pbar = tqdm.tqdm(range(init_step, max_steps))
-        if cfg.transient:
-            self.transient_module.train()
         for step in pbar:
             if not cfg.disable_viewer:
                 while self.viewer.state.status == "paused":
@@ -603,6 +613,7 @@ class Runner:
             )
 
             if cfg.transient:
+                self.transient_module.train()
                 error_per_pixel = torch.abs(colors.detach() - pixels)
                 if cfg.semantics:
                     sf = data["semantics"].to(device)
@@ -615,9 +626,13 @@ class Runner:
                     ).permute((2, 0, 1))
                     sf = torch.cat([sf, pos_enc], dim=0)
                     sf_flat = sf.reshape(sf.shape[0], -1).permute((1, 0))
-                    self.spotless_module.eval()
-                    weights = self.spotless_module(sf_flat).reshape(colors.shape[1], colors.shape[2])
+                    weights = self.transient_module(sf_flat).reshape(colors.shape[1], colors.shape[2])
                     pred_mask = weights.detach()
+                else:
+                    weights = self.transient_module(pixels.permute(0, 3, 1, 2))
+                    pred_mask = (weights.clone().detach() > 0.5).float()
+
+                if cfg.loss_type == "robust":
                     # calculate lower and upper bound masks for spotless mlp loss
                     lower_mask = self.robust_mask(
                         error_per_pixel, self.running_stats["lower_err"]
@@ -625,23 +640,18 @@ class Runner:
                     upper_mask = self.robust_mask(
                         error_per_pixel, self.running_stats["upper_err"]
                     )
+                    transient_loss = self.transient_loss(weights.flatten(), upper_mask.flatten(), lower_mask.flatten())
                 else:
-                    weights = self.transient_module(pixels.permute(0, 3, 1, 2))
-                    pred_mask = (weights.clone().detach() > 0.5).float()
-
-                if self.warmup_steps <= 0:
-                    if cfg.loss_type == "robust":
-                        transient_loss = self.transient_loss(weights.flatten(), upper_mask.flatten(), lower_mask.flatten())
+                    if cfg.blur:
+                        kernel = (15, 15)
+                        colors_blurred = gaussian_blur(colors[0].permute(2, 0, 1), kernel)
+                        pixels_blurred = gaussian_blur(pixels[0].permute(2, 0, 1), kernel)
+                        blurred_error_per_pixel = torch.mean(torch.abs(colors_blurred - pixels_blurred), dim=0).detach().squeeze()
+                        transient_loss = self.transient_loss(weights, blurred_error_per_pixel)
                     else:
-                        if cfg.blur:
-                            kernel = (15, 15)
-                            colors_blurred = gaussian_blur(colors[0].permute(2, 0, 1), kernel)
-                            pixels_blurred = gaussian_blur(pixels[0].permute(2, 0, 1), kernel)
-                            blurred_error_per_pixel = torch.mean(torch.abs(colors_blurred - pixels_blurred), dim=0).clone().detach().cpu().squeeze()
-                            transient_loss = self.transient_loss(weights, blurred_error_per_pixel)
-                        else:
-                            transient_loss = self.transient_loss(weights, error_per_pixel.detach().permute(0, 3, 1, 2).squeeze())
+                        transient_loss = self.transient_loss(weights, error_per_pixel.detach().permute(0, 3, 1, 2).squeeze())
 
+                transient_loss.backward()
             else:
                 pred_mask = self.robust_mask(
                     error_per_pixel, self.running_stats["avg_err"]
@@ -656,13 +666,6 @@ class Runner:
 
             l1loss *= pred_mask
             ssimloss *= pred_mask
-
-            diff = torch.abs(colors.detach() - pixels)
-            lower_mask = self.robust_mask(diff, self.running_stats["lower_err"])
-            upper_mask = self.robust_mask(diff, self.running_stats["upper_err"])
-
-            transient_loss = self.transient_loss(weights.flatten(), upper_mask.flatten(), lower_mask.flatten())
-            transient_loss.backward()
 
             loss = (l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda).mean()
             if cfg.depth_loss:
@@ -686,7 +689,6 @@ class Runner:
                 loss += depthloss * cfg.depth_lambda
 
             loss.backward()
-            transient_loss.backward()
 
             l1loss = l1loss.mean()
             ssimloss = ssimloss.mean()
@@ -918,6 +920,7 @@ class Runner:
         device = self.device
         self.transient_module.eval()
         for data in dataloader:
+            pixels = (data["image"].to(self.device) / 255.0)
             if self.cfg.transient:
                 if self.cfg.semantics:
                     sf = data["semantics"].to(device)
@@ -930,12 +933,10 @@ class Runner:
                     ).permute((2, 0, 1))
                     sf = torch.cat([sf, pos_enc], dim=0)
                     sf_flat = sf.reshape(sf.shape[0], -1).permute((1, 0))
-                    self.spotless_module.eval()
-                    pred_mask_up = self.spotless_module(sf_flat)
+                    pred_mask_up = self.transient_module(sf_flat)
                     mask = pred_mask_up.reshape(pixels.shape[1], pixels.shape[2])
                 else:
-                    pixels = (data["image"].to(self.device) / 255.0).permute(0, 3, 1, 2)
-                    weights = self.transient_module(pixels)
+                    weights = self.transient_module(pixels.permute(0, 3, 1, 2))
                     mask = (weights > 0.5).float()
             else:
                 camtoworlds = data["camtoworld"].to(device)
