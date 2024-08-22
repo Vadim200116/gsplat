@@ -10,6 +10,7 @@ import nerfview
 import numpy as np
 import torch
 import torch.nn.functional as F
+from torch import nn
 import tqdm
 import tyro
 import viser
@@ -19,7 +20,7 @@ from torch import Tensor
 from torch.utils.tensorboard import SummaryWriter
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
-from utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_random_seed, TransientModule, ssim, l1_loss
+from utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_random_seed, TransientModule, ssim, l1_loss, SpotlessModule, get_positional_encodings
 
 from gsplat.rendering import rasterization
 from gsplat.strategy import DefaultStrategy
@@ -44,10 +45,14 @@ class Config:
     val_keyword: str = ""
     # Use transient network
     transient: bool = False
+    # Whether to use semantics
+    semantics: bool = True
     # Random crop size for training  (experimental)
     patch_size: Optional[int] = None
     # A global scaler that applies to the scene size related parameters
     global_scale: float = 1.0
+    # Loss type
+    loss_type: str = "l1"
 
     # Port for the viewer server
     port: int = 8080
@@ -361,14 +366,24 @@ class Runner:
             ]
 
         if cfg.transient:
-            self.transient_module = TransientModule().cuda()
-
-            self.transient_optimizers = [torch.optim.Adam(
-                self.transient_module.parameters(), lr=1e-5,
-            )]
-            self.transient_loss = lambda p, minimum, maximum: torch.mean(
-      		    torch.nn.ReLU()(p - minimum) + torch.nn.ReLU()(maximum - p)
-      		)
+            if cfg.semantics:
+                self.transient_module = SpotlessModule(
+                    num_classes=1, num_features=self.trainset[0]["semantics"].shape[0] + 80
+                ).cuda()
+                self.transient_optimizers = [torch.optim.Adam(
+                    self.transient_module.parameters(), lr=1e-3,
+                )]
+            else:
+                self.transient_module = TransientModule().cuda()
+                self.transient_optimizers = [torch.optim.Adam(
+                    self.transient_module.parameters(), lr=1e-5,
+                )]
+            if cfg.loss_type == "robust":
+                self.transient_loss = lambda p, minimum, maximum: torch.mean(
+                    torch.nn.ReLU()(p - minimum) + torch.nn.ReLU()(maximum - p)
+                )
+            else:
+                self.transient_loss = lambda weights, l1: (weights * l1).mean() + 0.1 * torch.abs(1-weights).mean()
 
         # Losses & Metrics.
         self.ssim = ssim
@@ -578,25 +593,58 @@ class Runner:
             )
 
             if cfg.transient:
-                weights = self.transient_module(pixels.permute(0, 3, 1, 2))
-                pred_mask = (weights.clone().detach() > 0.5).float()
+                error_per_pixel = torch.abs(colors.detach() - pixels)
+                if cfg.semantics:
+                    sf = data["semantics"].to(device)
+                    sf = nn.Upsample(
+                            size=(colors.shape[1], colors.shape[2]),
+                            mode="bilinear",
+                    )(sf).squeeze(0)
+                    pos_enc = get_positional_encodings(
+                        colors.shape[1], colors.shape[2], 20
+                    ).permute((2, 0, 1))
+                    sf = torch.cat([sf, pos_enc], dim=0)
+                    sf_flat = sf.reshape(sf.shape[0], -1).permute((1, 0))
+                    self.spotless_module.eval()
+                    weights = self.spotless_module(sf_flat).reshape(colors.shape[1], colors.shape[2])
+                    pred_mask = weights.detach()
+                    # calculate lower and upper bound masks for spotless mlp loss
+                    lower_mask = self.robust_mask(
+                        error_per_pixel, self.running_stats["lower_err"]
+                    )
+                    upper_mask = self.robust_mask(
+                        error_per_pixel, self.running_stats["upper_err"]
+                    )
+                else:
+                    weights = self.transient_module(pixels.permute(0, 3, 1, 2))
+                    pred_mask = (weights.clone().detach() > 0.5).float()
 
-                if cfg.schedule:
-                    # schedule sampling of the mask based on alpha
-                    alpha = np.exp(cfg.schedule_beta * np.floor((1 + step) / 1.5))
-                    pred_mask = torch.bernoulli(
-                        torch.clip(alpha + (1 - alpha) * pred_mask.clone().detach(),
-                        min=0.0, max=1.0))
+                if self.warmup_steps <= 0:
+                    if cfg.loss_type == "robust":
+                        transient_loss = self.transient_loss(weights.flatten(), upper_mask.flatten(), lower_mask.flatten())
+                    else:
+                        transient_loss = self.transient_loss(weights.flatten(), error_per_pixel.detach().permute(0, 3, 1, 2).squeeze())
+            else:
+                pred_mask = self.robust_mask(
+                    error_per_pixel, self.running_stats["avg_err"]
+                )
 
-                l1loss *= pred_mask
-                ssimloss *= pred_mask
+            if cfg.schedule:
+                # schedule sampling of the mask based on alpha
+                alpha = np.exp(cfg.schedule_beta * np.floor((1 + step) / 1.5))
+                pred_mask = torch.bernoulli(
+                    torch.clip(alpha + (1 - alpha) * pred_mask.clone().detach(),
+                    min=0.0, max=1.0))
 
-                diff = torch.abs(colors.detach() - pixels)
-                lower_mask = self.robust_mask(diff, self.running_stats["lower_err"])
-                upper_mask = self.robust_mask(diff, self.running_stats["upper_err"])
+            l1loss *= pred_mask
+            ssimloss *= pred_mask
 
-                transient_loss = self.transient_loss(weights.flatten(), upper_mask.flatten(), lower_mask.flatten())
-                transient_loss.backward()
+            diff = torch.abs(colors.detach() - pixels)
+            lower_mask = self.robust_mask(diff, self.running_stats["lower_err"])
+            upper_mask = self.robust_mask(diff, self.running_stats["upper_err"])
+
+            transient_loss = self.transient_loss(weights.flatten(), upper_mask.flatten(), lower_mask.flatten())
+            transient_loss.backward()
 
             loss = (l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda).mean()
             if cfg.depth_loss:
@@ -620,6 +668,7 @@ class Runner:
                 loss += depthloss * cfg.depth_lambda
 
             loss.backward()
+            transient_loss.backward()
 
             l1loss = l1loss.mean()
             ssimloss = ssimloss.mean()
@@ -847,11 +896,48 @@ class Runner:
             return fuse_img.astype(np.uint8)
 
         masked_frames = []
+        device = self.device
         self.transient_module.eval()
         for data in dataloader:
-            pixels = (data["image"].to(self.device) / 255.0).permute(0, 3, 1, 2)
-            weights = self.transient_module(pixels)
-            mask = (weights > 0.5).float()
+            if self.cfg.transient:
+                if self.cfg.semantics:
+                    sf = data["semantics"].to(device)
+                    sf = nn.Upsample(
+                        size=(pixels.shape[1], pixels.shape[2]),
+                        mode="bilinear",
+                    )(sf).squeeze(0)
+                    pos_enc = get_positional_encodings(
+                        pixels.shape[1], pixels.shape[2], 20
+                    ).permute((2, 0, 1))
+                    sf = torch.cat([sf, pos_enc], dim=0)
+                    sf_flat = sf.reshape(sf.shape[0], -1).permute((1, 0))
+                    self.spotless_module.eval()
+                    pred_mask_up = self.spotless_module(sf_flat)
+                    mask = pred_mask_up.reshape(pixels.shape[1], pixels.shape[2])
+                else:
+                    pixels = (data["image"].to(self.device) / 255.0).permute(0, 3, 1, 2)
+                    weights = self.transient_module(pixels)
+                    mask = (weights > 0.5).float()
+            else:
+                camtoworlds = data["camtoworld"].to(device)
+                Ks = data["K"].to(device)
+                height, width = pixels.shape[1:3]
+                colors, _, _ = self.rasterize_splats(
+                    camtoworlds=camtoworlds,
+                    Ks=Ks,
+                    width=width,
+                    height=height,
+                    sh_degree=cfg.sh_degree,
+                    near_plane=cfg.near_plane,
+                    far_plane=cfg.far_plane,
+                )  # [1, H, W, 3]
+                colors = torch.clamp(colors, 0.0, 1.0)
+
+                error_per_pixel = torch.abs(colors - pixels)
+                mask = self.robust_mask(
+                    error_per_pixel, self.running_stats["avg_err"]
+                ).reshape(pixels.shape[1], pixels.shape[2])
+
             masked_frame = mask_frame(data["image"].squeeze().numpy(), mask)
             masked_frames.append(masked_frame)
 
