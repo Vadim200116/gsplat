@@ -14,7 +14,7 @@ from torch import nn
 import tqdm
 import tyro
 import viser
-from datasets.colmap import Dataset, Parser, CustomDataset
+from datasets.colmap import Dataset, Parser, CustomDataset, ClutterDataset
 from datasets.traj import generate_interpolated_path
 from torch import Tensor
 from torch.utils.tensorboard import SummaryWriter
@@ -274,14 +274,22 @@ class Runner:
             normalize=True,
             test_every=cfg.test_every,
         )
-        self.trainset = CustomDataset(
+        self.trainset = ClutterDataset(
             self.parser,
             split="train",
             patch_size=cfg.patch_size,
             load_depths=cfg.depth_loss,
-            val_keyword=cfg.val_keyword,
+            train_keyword=cfg.train_keyword,
+            test_keyword=cfg.test_keyword,
+            semantics=cfg.semantics,
         )
-        self.valset = CustomDataset(self.parser, split="val", val_keyword=cfg.val_keyword)
+        self.valset = ClutterDataset(
+            self.parser,
+            split="test",
+            train_keyword=cfg.train_keyword,
+            test_keyword=cfg.test_keyword,
+            semantics=False,
+        )
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
         print("Scene scale:", self.scene_scale)
 

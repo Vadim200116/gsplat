@@ -4,6 +4,9 @@ from typing import Any, Dict, List, Optional
 import cv2
 import imageio.v2 as imageio
 import numpy as np
+import scipy as sp
+from sklearn.cluster import AgglomerativeClustering
+from sklearn.neighbors import kneighbors_graph
 import torch
 from pycolmap import SceneManager
 from pathlib import Path
@@ -238,6 +241,56 @@ class Parser:
         self.scene_scale = np.max(dists)
 
 
+class SemanticParser(Parser):
+    """COLMAP parser for cluttered scenes."""
+
+    def __init__(
+        self,
+        data_dir: str,
+        factor: int = 1,
+        normalize: bool = False,
+        load_keyword: str = "clutter",
+        semantic_dir: str = "SD",
+        cluster: bool = False,
+    ):
+        super().__init__(
+            data_dir,
+            factor,
+            normalize,
+            -1,
+        )
+        self.features = []
+        imdirectory = "images"
+        if factor > 1:
+            imdirectory = f"images_{factor}"
+        for ind, impath in enumerate(self.image_paths):
+            image_id = self.image_names[ind].split(".")[-2]
+            cid = self.camera_ids[ind]
+            if self.image_names[ind].find(load_keyword) != -1:
+                feature_path = os.path.join(
+                    os.path.join(data_dir, semantic_dir), f"{image_id}.npy"
+                )
+                feature = np.load(feature_path)
+                if cluster:
+                    ft_flat = np.transpose(feature.reshape((1280, 50 * 50)), (1, 0))
+                    x = np.linspace(0, 1, 50)
+                    y = np.linspace(0, 1, 50)
+                    xv, yv = np.meshgrid(x, y)
+                    indxy = np.reshape(np.stack([xv, yv], axis=-1), (50 * 50, 2))
+                    knn_graph = kneighbors_graph(indxy, 8, include_self=False)
+                    model = AgglomerativeClustering(
+                        linkage="ward", connectivity=knn_graph, n_clusters=100
+                    )
+                    model.fit(ft_flat)
+                    feature = np.array(
+                        [model.labels_ == i for i in range(model.n_clusters)],
+                        dtype=np.float32,
+                    ).reshape((model.n_clusters, 50, 50))
+                self.features.append(feature)
+            else:
+                self.features.append([])
+
+
 class Dataset:
     """A simple dataset class."""
 
@@ -323,6 +376,53 @@ class Dataset:
 
         return data
 
+class ClutterDataset(Dataset):
+    """A dataset class for cluttered scenes."""
+
+    def __init__(
+        self,
+        parser: Parser,
+        split: str = "train",
+        patch_size: Optional[int] = None,
+        load_depths: bool = False,
+        train_keyword: str = "clutter",
+        test_keyword: str = "extra",
+        semantics: bool = False,
+    ):
+        super().__init__(
+            parser,
+            split,
+            patch_size,
+            load_depths,
+        )
+        indices = np.arange(len(self.parser.image_names))
+        self.semantics = semantics
+        if train_keyword == "":
+            if split == "train":
+                self.indices = indices[indices % self.parser.test_every != 0]
+            else:
+                self.indices = indices[indices % self.parser.test_every == 0]
+        else:
+            if split == "train":
+                self.indices = [
+                    idx
+                    for idx in indices
+                    if self.parser.image_names[idx].find(train_keyword) != -1
+                ]
+            else:
+                self.indices = [
+                    idx
+                    for idx in indices
+                    if self.parser.image_names[idx].find(test_keyword) != -1
+                ]
+
+    def __getitem__(self, item: int) -> Dict[str, Any]:
+        data = super().__getitem__(item)
+        if self.semantics:
+            index = self.indices[item]
+            data["semantics"] = torch.from_numpy(self.parser.features[index]).float()
+
+        return data
 
 class CustomDataset(Dataset):
     def __init__(
