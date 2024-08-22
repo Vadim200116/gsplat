@@ -24,6 +24,7 @@ from utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_rand
 
 from gsplat.rendering import rasterization
 from gsplat.strategy import DefaultStrategy
+from torchvision.transforms.functional import gaussian_blur
 
 
 @dataclass
@@ -53,7 +54,8 @@ class Config:
     global_scale: float = 1.0
     # Loss type
     loss_type: str = "l1"
-
+    # Whether to blur images before l1
+    blur: bool = False
     # Port for the viewer server
     port: int = 8080
 
@@ -631,7 +633,15 @@ class Runner:
                     if cfg.loss_type == "robust":
                         transient_loss = self.transient_loss(weights.flatten(), upper_mask.flatten(), lower_mask.flatten())
                     else:
-                        transient_loss = self.transient_loss(weights.flatten(), error_per_pixel.detach().permute(0, 3, 1, 2).squeeze())
+                        if cfg.blur:
+                            kernel = (15, 15)
+                            colors_blurred = gaussian_blur(colors[0].permute(2, 0, 1), kernel)
+                            pixels_blurred = gaussian_blur(pixels[0].permute(2, 0, 1), kernel)
+                            blurred_error_per_pixel = torch.mean(torch.abs(colors_blurred - pixels_blurred), dim=0).clone().detach().cpu().squeeze()
+                            transient_loss = self.transient_loss(weights, blurred_error_per_pixel)
+                        else:
+                            transient_loss = self.transient_loss(weights, error_per_pixel.detach().permute(0, 3, 1, 2).squeeze())
+
             else:
                 pred_mask = self.robust_mask(
                     error_per_pixel, self.running_stats["avg_err"]
@@ -705,6 +715,7 @@ class Runner:
                     self.writer.add_image("train/render", canvas, step)
                 self.writer.flush()
 
+            #TODO: blur here
             info["err"] = torch.histogram(
                     torch.mean(torch.abs(
                         colors - pixels), dim=-3).clone().detach().cpu(),
