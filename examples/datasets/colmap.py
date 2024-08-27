@@ -300,11 +300,13 @@ class Dataset:
         split: str = "train",
         patch_size: Optional[int] = None,
         load_depths: bool = False,
+        load_depth_for_pearson: bool = False,
     ):
         self.parser = parser
         self.split = split
         self.patch_size = patch_size
         self.load_depths = load_depths
+        self.load_depth_for_pearson = load_depth_for_pearson
         indices = np.arange(len(self.parser.image_names))
         if split == "train":
             self.indices = indices[indices % self.parser.test_every != 0]
@@ -348,6 +350,18 @@ class Dataset:
             "image_id": item,  # the index of the image in the dataset
         }
 
+        if self.load_depth_for_pearson:
+            depth_path = os.path.join(
+                self.parser.data_dir, "depth_pred/depth_npy", f"{self.parser.image_names[index].split('.')[0]}_pred.npy"
+            )
+
+            depth = np.load(depth_path)
+            h, w = image.shape[:2]
+            resized_depth = cv2.resize(depth, (w, h), interpolation=cv2.INTER_CUBIC)
+            resized_depth = torch.Tensor((resized_depth - resized_depth.min())/(resized_depth.max() - resized_depth.min())).cuda()
+
+            data["depth"] = resized_depth
+
         if self.load_depths:
             # projected points to image plane to get depths
             worldtocams = np.linalg.inv(camtoworlds)
@@ -385,6 +399,7 @@ class ClutterDataset(Dataset):
         split: str = "train",
         patch_size: Optional[int] = None,
         load_depths: bool = False,
+        load_depth_for_pearson: bool = False,
         train_keyword: str = "clutter",
         test_keyword: str = "extra",
         semantics: bool = False,
@@ -394,6 +409,7 @@ class ClutterDataset(Dataset):
             split,
             patch_size,
             load_depths,
+            load_depth_for_pearson,
         )
         indices = np.arange(len(self.parser.image_names))
         self.semantics = semantics

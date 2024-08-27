@@ -20,7 +20,7 @@ from torch import Tensor
 from torch.utils.tensorboard import SummaryWriter
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
-from utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_random_seed, TransientModule, ssim, l1_loss, SpotLessModule, get_positional_encodings
+from utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_random_seed, TransientModule, ssim, l1_loss, SpotLessModule, get_positional_encodings, pearson_depth_loss
 
 from gsplat.rendering import rasterization
 from gsplat.strategy import DefaultStrategy
@@ -161,6 +161,8 @@ class Config:
     depth_loss: bool = False
     # Weight for depth loss
     depth_lambda: float = 1e-2
+    # Enable pearson loss on depth
+    pearson_loss: bool = False
 
     # Dump information to tensorboard every this steps
     tb_every: int = 100
@@ -296,6 +298,7 @@ class Runner:
             train_keyword=cfg.train_keyword,
             test_keyword=cfg.test_keyword,
             semantics=cfg.semantics,
+            load_depth_for_pearson=cfg.pearson_loss,
         )
         self.valset = ClutterDataset(
             self.parser,
@@ -589,7 +592,7 @@ class Runner:
                 near_plane=cfg.near_plane,
                 far_plane=cfg.far_plane,
                 image_ids=image_ids,
-                render_mode="RGB+ED" if cfg.depth_loss else "RGB",
+                render_mode="RGB+ED" if (cfg.depth_loss or cfg.pearson_loss) else "RGB",
             )
             if renders.shape[-1] == 4:
                 colors, depths = renders[..., 0:3], renders[..., 3:4]
@@ -614,6 +617,9 @@ class Runner:
 
             if cfg.transient:
                 self.transient_module.train()
+                if cfg.pearson_loss:
+                    pearson_loss = pearson_depth_loss(depths.squeeze().to(device), data["depth"].to(device))
+
                 error_per_pixel = torch.abs(colors.detach() - pixels)
                 if cfg.semantics:
                     sf = data["semantics"].to(device)
@@ -649,7 +655,8 @@ class Runner:
                         blurred_error_per_pixel = torch.mean(torch.abs(colors_blurred - pixels_blurred), dim=0).detach().squeeze()
                         transient_loss = self.transient_loss(weights, blurred_error_per_pixel)
                     else:
-                        transient_loss = self.transient_loss(weights, error_per_pixel.detach().permute(0, 3, 1, 2).squeeze())
+                        if cfg.pearson_loss:
+                            transient_loss = self.transient_loss(weights, error_per_pixel.detach().permute(0, 3, 1, 2).squeeze()) + 1 - (weights * pearson_loss.detach()).mean()
 
                 transient_loss.backward()
             else:
@@ -668,6 +675,8 @@ class Runner:
             ssimloss *= pred_mask
 
             loss = (l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda).mean()
+            if cfg.pearson_loss:
+                loss += 1 - (pearson_loss * pred_mask).mean()
             if cfg.depth_loss:
                 # query depths from depth map
                 points = torch.stack(

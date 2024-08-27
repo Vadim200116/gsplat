@@ -266,6 +266,15 @@ class SpotLessModule(torch.nn.Module):
 def l1_loss(network_output, gt):
     return torch.abs((network_output - gt))
 
+def pearson_depth_loss(depth_src, depth_target):
+    src = depth_src - depth_src.mean()
+    target = depth_target - depth_target.mean()
+
+    src = src / (src.std() + 1e-6)
+    target = target / (target.std() + 1e-6)
+
+    return src * target
+
 def gaussian(window_size, sigma):
     gauss = torch.Tensor([exp(-(x - window_size // 2) ** 2 / float(2 * sigma ** 2)) for x in range(window_size)])
     return gauss / gauss.sum()
